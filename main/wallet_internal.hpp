@@ -1,7 +1,9 @@
 #pragma once
 
+#include "cashu.hpp"
 #include <nvs.h>
 #include <string>
+#include <vector>
 
 // Shared internals of the cashu::Wallet implementation, which is split
 // across the wallet*.cpp translation units (core, nvs, identity, keysets,
@@ -11,6 +13,15 @@
 #define TAG "wallet"
 
 namespace cashu {
+
+// Proof store: one NVS entry per proof instead of one entry for the whole
+// set. Declared here (not in wallet.hpp) so the storage layer stays internal;
+// Wallet::save_proofs()/load_proofs() are one-line delegates, and the native
+// (non-ESP32) test harness drives exactly the same entry points.
+namespace proof_store {
+bool save(int slot, const std::vector<Proof>& proofs);
+bool load(int slot, std::vector<Proof>& out);
+} // namespace proof_store
 
 // NVS namespace holding every wallet key (per-slot blobs, global seed,
 // counters, default unit, pending queue).

@@ -19,6 +19,336 @@ static void slot_key(char* buf, size_t sz, const char* base, int slot)
 namespace cashu {
 
 // -------------------------------------------------------------------------
+// Proof store
+// -------------------------------------------------------------------------
+//
+// Schema (namespace "wallet"), one wallet slot:
+//
+//   pn_<slot>      u16     number of proof slots. A HIGH-WATER MARK, not a
+//                          live count: indices below it may be empty (a hole
+//                          left by an earlier erase or by an interrupted
+//                          save), and holes are reused before the mark grows.
+//   p<slot>_<i>    blob    one serialized Proof at slot i < pn_<slot>, in the
+//                          same JSON encoding the single-blob format stored
+//                          inside its array.
+//   proofs_<slot>  blob    LEGACY: the whole proof set as one JSON array.
+//                          Read-only fallback, retired once the per-proof
+//                          store above is durable.
+//
+// Why: the legacy format re-serialised the entire proof set on every
+// mutation, so every payment paid O(total proofs) bytes of flash (measured
+// on the native harness: 47 202 B written per mutation at 200 proofs). Proofs
+// are independent bearer tokens, so their persistence does not have to be one
+// entry: with one NVS entry per proof a mutation writes only the entries that
+// actually changed -- a spend with two change outputs writes two entries plus
+// the count, and erases the spent ones.
+//
+// Crash consistency rests on two things:
+//   1. NVS gives per-key atomicity: an interrupted commit never leaves a
+//      half-written entry (the entry is written and CRC'd first, and the page
+//      index only then points at it), so every key on flash is either its old
+//      value or its new one.
+//   2. The write order used below -- new proofs, then the count, then the
+//      erases -- means an interruption can leave STALE proofs behind but can
+//      never remove a proof that was already stored. After any interruption
+//      the stored set S satisfies:
+//
+//          old ∩ new  ⊆  S  ⊆  old ∪ new
+//
+//      Stale proofs are spent proofs, which the mint rejects (and a future
+//      NUT-07 state check would clean up); losing a proof would be losing
+//      money. The legacy format had a different property -- a mutation was
+//      all-or-nothing -- and it kept it only at the cost of rewriting
+//      everything.
+namespace proof_store {
+namespace {
+
+// FNV-1a over the serialized proof. Used ONLY to prune the byte comparisons
+// below: equality is always decided by comparing the bytes themselves, so a
+// fingerprint collision can cost a redundant write and can never leave a
+// proof unpersisted.
+uint32_t proof_fingerprint(const std::string& s)
+{
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+void proof_count_key(char* buf, size_t sz, int slot)
+{
+    snprintf(buf, sz, "pn_%d", slot);
+}
+
+// ESP-IDF allows 15 characters plus NUL; the longest key built here is
+// "p2_65535" (8). Slot indices above 65535 are rejected rather than wrapped.
+void proof_slot_key(char* buf, size_t sz, int slot, unsigned idx)
+{
+    snprintf(buf, sz, "p%d_%u", slot, idx);
+}
+
+void legacy_proofs_key(char* buf, size_t sz, int slot)
+{
+    snprintf(buf, sz, "proofs_%d", slot);
+}
+
+constexpr unsigned PROOF_SLOT_MAX = 65535u;
+
+// ESP_OK with `out` holding the stored bytes; ESP_ERR_NVS_NOT_FOUND for a
+// hole or a slot that was never written.
+esp_err_t read_proof_slot(nvs_handle_t h, int slot, unsigned idx, std::string& out)
+{
+    char key[16];
+    proof_slot_key(key, sizeof(key), slot, idx);
+    size_t len = 0;
+    if (nvs_get_blob(h, key, nullptr, &len) != ESP_OK || len == 0)
+        return ESP_ERR_NVS_NOT_FOUND;
+    out.assign(len, '\0');
+    size_t got = len;
+    if (nvs_get_blob(h, key, &out[0], &got) != ESP_OK)
+        return ESP_ERR_NVS_INVALID_STATE;
+    out.resize(got);
+    return ESP_OK;
+}
+
+bool tolerated(esp_err_t e)
+{
+    return e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND;
+}
+
+} // namespace
+
+// Write `proofs` as wallet slot `slot`, touching only what changed.
+bool save(int slot, const std::vector<Proof>& proofs)
+{
+    // Serialize-validate the whole new state first: an unserializable proof
+    // must abort the save before anything is written, never leave a
+    // half-updated store ("[]" is a legitimate empty set, not a substitute
+    // for one that failed to serialize). The fingerprints computed here are
+    // reused by the pairing pass below.
+    std::vector<uint32_t> fp;
+    fp.reserve(proofs.size());
+    for (const Proof& p : proofs) {
+        std::string s = serialize(p);
+        if (s.empty()) {
+            ESP_LOGE(TAG, "save_proofs: serialization failed, keeping stored proofs");
+            return false;
+        }
+        fp.push_back(proof_fingerprint(s));
+    }
+
+    Nvs nvs(NVS_READWRITE);
+    if (!nvs.ok()) {
+        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(nvs.err()));
+        return false;
+    }
+    nvs_handle_t h = nvs.get();
+
+    char cnt_key[16];
+    proof_count_key(cnt_key, sizeof(cnt_key), slot);
+    uint16_t stored_count = 0;
+    esp_err_t err = nvs_get_u16(h, cnt_key, &stored_count);
+    const bool established = (err == ESP_OK);   // per-proof store already live
+    if (!tolerated(err)) {
+        ESP_LOGE(TAG, "save_proofs: read %s failed: %s", cnt_key, esp_err_to_name(err));
+        return false;
+    }
+    if (!established)
+        stored_count = 0;
+
+    // Pair stored slots with the in-RAM proofs: each stored slot pairs with at
+    // most one proof and vice versa. Paired slots are byte-identical to what
+    // is already on flash and are NOT rewritten -- that is where the write
+    // saving comes from. Unpaired stored slots are stale (spent/superseded);
+    // unpaired proofs are new.
+    std::vector<bool> paired(proofs.size(), false);
+    std::vector<unsigned> reuse;    // holes: filled before the mark grows
+    std::vector<unsigned> stale;    // kept alive until the very last step
+    unsigned high_water = 0;
+
+    for (unsigned i = 0; i < stored_count; i++) {
+        std::string stored;
+        if (read_proof_slot(h, slot, i, stored) != ESP_OK) {
+            reuse.push_back(i);
+            continue;
+        }
+        const uint32_t sfp = proof_fingerprint(stored);
+        size_t hit = proofs.size();
+        for (size_t j = 0; j < proofs.size(); j++) {
+            if (paired[j] || fp[j] != sfp)
+                continue;
+            if (serialize(proofs[j]) == stored) {   // exact, not fingerprint
+                hit = j;
+                break;
+            }
+        }
+        if (hit == proofs.size()) {
+            stale.push_back(i);
+        } else {
+            paired[hit] = true;
+            high_water = i + 1;
+        }
+    }
+
+    struct Pending { unsigned slot; size_t index; };
+    std::vector<Pending> pending;
+    pending.reserve(proofs.size());
+    unsigned append_slot = stored_count;
+    size_t reuse_pos = 0;
+
+    for (size_t j = 0; j < proofs.size(); j++) {
+        if (paired[j])
+            continue;
+        unsigned target;
+        if (reuse_pos < reuse.size())
+            target = reuse[reuse_pos++];
+        else
+            target = append_slot++;
+        if (target > PROOF_SLOT_MAX) {
+            ESP_LOGE(TAG, "save_proofs: proof store full (%u slots)", target);
+            return false;
+        }
+        if (target + 1 > high_water)
+            high_water = target + 1;
+        pending.push_back(Pending{target, j});
+    }
+
+    const uint16_t new_count = (uint16_t)high_water;
+
+    // (a) New proofs first. Appended ones are above the count and therefore
+    //     invisible until step (b); an interruption here leaves the previous
+    //     state intact plus, at most, some proofs nobody can read yet.
+    for (const Pending& w : pending) {
+        char key[16];
+        proof_slot_key(key, sizeof(key), slot, w.slot);
+        std::string blob = serialize(proofs[w.index]);
+        if (blob.empty()) {   // unreachable: validated up front
+            ESP_LOGE(TAG, "save_proofs: serialization failed mid-save");
+            return false;
+        }
+        err = nvs_set_blob(h, key, blob.data(), blob.size());
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "save_proofs: write %s failed: %s", key, esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    // (b) Then the high-water mark, which publishes the appends. It is written
+    //     even when it does not change if the per-proof store is not live yet,
+    //     so that "this wallet has been saved, with N proofs" is always a
+    //     durable fact (the old format wrote "[]" for an empty set).
+    if (!established || new_count != stored_count) {
+        err = nvs_set_u16(h, cnt_key, new_count);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "save_proofs: write %s failed: %s", cnt_key, esp_err_to_name(err));
+            return false;
+        }
+    }
+
+    // (c) Then the erases, last, so an interruption cannot leave a slot that
+    //     the previous state considered occupied while its proof is gone.
+    for (unsigned i : stale) {
+        char key[16];
+        proof_slot_key(key, sizeof(key), slot, i);
+        esp_err_t e = nvs_erase_key(h, key);
+        if (!tolerated(e)) {
+            ESP_LOGE(TAG, "save_proofs: erase %s failed: %s", key, esp_err_to_name(e));
+            return false;
+        }
+    }
+
+    // Legacy blob: once the per-proof store is live, a lingering copy is dead
+    // weight (a stale proof set, ~47 kB of the partition at 200 proofs), so
+    // the next save retires it.
+    char legacy[16];
+    legacy_proofs_key(legacy, sizeof(legacy), slot);
+    if (established)
+        nvs_erase_key(h, legacy);
+
+    err = nvs_commit(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_proofs failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    // First migration only: the legacy blob is retired AFTER the per-proof
+    // store is durable, so an interrupted migration always leaves a complete
+    // readable copy behind.
+    if (!established) {
+        nvs_erase_key(h, legacy);
+        if (nvs_commit(h) != ESP_OK)
+            ESP_LOGW(TAG, "save_proofs: legacy blob not retired (will retry)");
+    }
+
+    ESP_LOGI(TAG, "[%d] saved %d proofs (%u of %u slots written, %u erased)",
+             slot, (int)proofs.size(), (unsigned)pending.size(),
+             (unsigned)high_water, (unsigned)stale.size());
+    return true;
+}
+
+// Load wallet slot `slot`, migrating a legacy single-blob store in place (the
+// blob stays untouched until the next successful save re-writes it).
+bool load(int slot, std::vector<Proof>& out)
+{
+    Nvs nvs(NVS_READONLY);
+    if (!nvs.ok())
+        return false;
+    nvs_handle_t h = nvs.get();
+
+    char cnt_key[16];
+    proof_count_key(cnt_key, sizeof(cnt_key), slot);
+    uint16_t count = 0;
+    esp_err_t err = nvs_get_u16(h, cnt_key, &count);
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        char key[16];
+        legacy_proofs_key(key, sizeof(key), slot);
+        std::string blob;
+        if (!nvs.get_blob(key, blob))
+            return false;
+        std::vector<Proof> loaded;
+        if (!proofs_from_json(blob.c_str(), loaded))
+            return false;
+        out = std::move(loaded);
+        ESP_LOGI(TAG, "[%d] loaded %d proofs from NVS (legacy blob)",
+                 slot, (int)out.size());
+        return true;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "load_proofs: read %s failed: %s", cnt_key, esp_err_to_name(err));
+        return false;
+    }
+
+    std::vector<Proof> loaded;
+    loaded.reserve(count);
+    unsigned unreadable = 0;
+    for (unsigned i = 0; i < count; i++) {
+        std::string blob;
+        if (read_proof_slot(h, slot, i, blob) != ESP_OK)
+            continue;   // hole: a spent proof, erased, or an interrupted save
+        Proof p{};
+        if (!deserialize(blob.c_str(), p)) {
+            // One unreadable entry used to fail the whole set. It is now
+            // isolated: the other proofs still load, and the next save
+            // rewrites this slot from the in-RAM copy.
+            ESP_LOGE(TAG, "[%d] slot %u unreadable, skipping", slot, i);
+            unreadable++;
+            continue;
+        }
+        loaded.push_back(std::move(p));
+    }
+    out = std::move(loaded);
+    ESP_LOGI(TAG, "[%d] loaded %d proofs from NVS (%u slots%s)",
+             slot, (int)out.size(), (unsigned)count,
+             unreadable ? ", some unreadable" : "");
+    return true;
+}
+
+} // namespace proof_store
+
+// -------------------------------------------------------------------------
 // NVS persistence
 // -------------------------------------------------------------------------
 
@@ -58,6 +388,20 @@ bool Wallet::erase_nvs()
     nvs_erase_key(nvs.get(), key);
     slot_key(key, sizeof(key), "proofs", nvs_slot_);
     nvs_erase_key(nvs.get(), key);
+    // Per-proof store (proof_store::): the slot count, then every slot below
+    // it. Absent holes are fine — nvs_erase_key reports NOT_FOUND and the
+    // commit below is what has to succeed.
+    snprintf(key, sizeof(key), "pn_%d", nvs_slot_);
+    uint16_t proof_slots = 0;
+    esp_err_t perr = nvs_get_u16(nvs.get(), key, &proof_slots);
+    nvs_erase_key(nvs.get(), key);
+    if (perr == ESP_OK) {
+        for (unsigned i = 0; i < proof_slots; i++) {
+            char pkey[16];
+            snprintf(pkey, sizeof(pkey), "p%d_%u", nvs_slot_, i);
+            nvs_erase_key(nvs.get(), pkey);
+        }
+    }
     // Legacy single-blob keyset entry
     slot_key(key, sizeof(key), "keys", nvs_slot_);
     nvs_erase_key(nvs.get(), key);
@@ -78,54 +422,16 @@ bool Wallet::erase_nvs()
     return true;
 }
 
+// The proof store itself lives in proof_store:: (top of this file); these two
+// are the wallet's thin wrappers over it.
 bool Wallet::save_proofs()
 {
-    std::string blob = proofs_to_json(proofs_);
-    // proofs_to_json returns "" only on allocation failure ("[]" for an
-    // empty wallet). Never let that overwrite stored proofs with nothing —
-    // they are bearer money.
-    if (blob.empty() && !proofs_.empty()) {
-        ESP_LOGE(TAG, "save_proofs: serialization failed, keeping stored proofs");
-        return false;
-    }
-
-    Nvs nvs(NVS_READWRITE);
-    if (!nvs.ok()) {
-        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(nvs.err()));
-        return false;
-    }
-
-    char key[16];
-    slot_key(key, sizeof(key), "proofs", nvs_slot_);
-    esp_err_t err = nvs_set_blob(nvs.get(), key, blob.data(), blob.size());
-    if (err == ESP_OK)
-        err = nvs_commit(nvs.get());
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "save_proofs failed: %s", esp_err_to_name(err));
-        return false;
-    }
-    ESP_LOGI(TAG, "[%d] saved %d proofs (%d bytes)",
-             nvs_slot_, (int)proofs_.size(), (int)blob.size());
-    return true;
+    return proof_store::save(nvs_slot_, proofs_);
 }
 
 bool Wallet::load_proofs()
 {
-    Nvs nvs(NVS_READONLY);
-    char key[16];
-    slot_key(key, sizeof(key), "proofs", nvs_slot_);
-    std::string blob;
-    if (!nvs.get_blob(key, blob))
-        return false;
-
-    std::vector<Proof> loaded;
-    if (!proofs_from_json(blob.c_str(), loaded))
-        return false;
-
-    proofs_ = std::move(loaded);
-    ESP_LOGI(TAG, "[%d] loaded %d proofs from NVS", nvs_slot_, (int)proofs_.size());
-    return true;
+    return proof_store::load(nvs_slot_, proofs_);
 }
 
 bool Wallet::save_keysets()
